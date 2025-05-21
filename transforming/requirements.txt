@@ -1,0 +1,28 @@
+# EU Procurement Monitoring System Requirements
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.23.0
+scikit-learn>=1.2.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+requests>=2.28.0
+
+# Data handling
+python-dateutil>=2.8.2
+pytz>=2023.3
+
+# Database
+SQLAlchemy>=2.0.0  # Optional: For more advanced database operations
+
+# Visualization
+plotly>=5.13.0  # Optional: For interactive visualizations
+
+# Testing
+pytest>=7.3.1  # Optional: For unit testing
+
+# Documentation
+sphinx>=6.1.3  # Optional: For generating documentation
+
+# Code quality
+black>=23.3.0  # Optional: For code formatting
+flake8>=6.0.0  # Optional: For code linting

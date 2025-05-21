@@ -1,0 +1,11 @@
+EU Procurement Analysis Report
+Generated: 2025-05-21 13:25:59
+Data period: Last 30 days
+Records analyzed: 446
+Outliers detected: 0 (0.00%)
+
+Visualizations:
+- ./visualizations/report_20250521_132558_values.png
+- ./visualizations/report_20250521_132558_outliers.png
+- ./visualizations/report_20250521_132558_countries.png
+- ./visualizations/report_20250521_132558_report.png
