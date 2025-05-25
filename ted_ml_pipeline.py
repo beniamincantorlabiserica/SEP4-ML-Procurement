@@ -61,7 +61,7 @@ class TEDMLPipeline:
         
         # Initialize components
         self.storage = TEDDataStorage(
-            data_dir=self.directories["processed_data"]
+            db_path=os.path.join(self.directories["processed_data"], "ted_results.db")
         )
         
         self.visualizer = TEDVisualizer(
@@ -126,8 +126,7 @@ class TEDMLPipeline:
             
             # Step 3: Store processed data if requested
             if store and 'ml_dataset' in output_files:
-                print("Storing processed data in database...")
-                self.storage.store_data(output_files['ml_dataset'])
+                print("Data ready for model processing and storage")
             
             print(f"Data synchronization completed successfully: {len(df)} records processed")
             
@@ -315,12 +314,16 @@ class TEDMLPipeline:
             
             # Save outliers to storage
             try:
-                self.storage.store_outliers(
-                    result_df[result_df['is_outlier']], 
-                    model_version="isolation_forest"
+                run_id = self.storage.store_results(
+                    model_type="isolation_forest",
+                    result_df=result_df,
+                    parameters={"contamination": self.model.contamination if self.model else 0.05},
+                    notes=f"Prediction run from {start_date or 'file'} to {end_date or 'file'}"
                 )
+                if run_id:
+                    print(f"Results stored in database with run ID: {run_id}")
             except Exception as e:
-                logger.warning(f"Could not store outliers in database: {e}")
+                logger.warning(f"Could not store results in database: {e}")
             
             # Prepare result information
             result = {

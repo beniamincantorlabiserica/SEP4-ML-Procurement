@@ -1,405 +1,273 @@
 #!/usr/bin/env python3
 """
-TED Data Storage Module
-This module handles the persistent storage of processed procurement data.
-It provides functionality for storing, retrieving, and managing datasets.
-
+Simplified TED Data Storage Module
+A clean and simple database for storing model results and statistics.
 """
 import os
-import pandas as pd
-import shutil
-from datetime import datetime
-import json
 import sqlite3
+import pandas as pd
+import json
+import uuid
+from datetime import datetime
 import logging
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 class TEDDataStorage:
-    """Class for persistent storage of processed TED procurement data"""
+    """Simple storage for TED procurement analysis results"""
     
-    def __init__(self, data_dir="data/processed", db_path=None, max_storage_days=365):
-        """
-        Initialize the data storage component
+    def __init__(self, db_path="data/ted_results.db"):
+        """Initialize storage with database path"""
+        self.db_path = db_path
         
-        Args:
-            data_dir (str): Directory for CSV storage
-            db_path (str): Path to SQLite database file (if None, defaults to data_dir/ted_data.db)
-            max_storage_days (int): Maximum number of days to keep historical data
-        """
-        self.data_dir = data_dir
-        self.db_path = db_path or os.path.join(data_dir, "ted_data.db")
-        self.max_storage_days = max_storage_days
-        self.metadata_file = os.path.join(data_dir, "metadata.json")
-        
-        # Ensure data directory exists
-        os.makedirs(data_dir, exist_ok=True)
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         
         # Initialize database
         self._init_database()
-        
-        # Initialize metadata if needed
-        if not os.path.exists(self.metadata_file):
-            self._init_metadata()
-            
+        logger.info(f"Storage initialized: {self.db_path}")
+    
     def _init_database(self):
-        """Initialize the SQLite database with required schema"""
-        try:
-            conn = sqlite3.connect(self.db_path)
+        """Create database tables if they don't exist"""
+        with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             
-            # Create main table for storing procurement data
+            # Table 1: Model runs metadata
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS procurement_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                notice_identifier TEXT,
-                value_eur REAL,
-                country TEXT,
-                notice_type TEXT,
-                created_date TEXT,
-                bidder_count INTEGER,
-                bidder_size TEXT,
-                data_file TEXT,
-                import_date TEXT
-            )
+                CREATE TABLE IF NOT EXISTS model_runs (
+                    run_id TEXT PRIMARY KEY,
+                    model_type TEXT NOT NULL,
+                    parameters TEXT,
+                    execution_date TEXT NOT NULL,
+                    record_count INTEGER,
+                    outlier_count INTEGER,
+                    outlier_percentage REAL,
+                    notes TEXT
+                )
             ''')
             
-            # Create table for outliers
+            # Table 2: All procurement results with outlier info
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS outliers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                notice_identifier TEXT,
-                value_eur REAL,
-                outlier_score REAL,
-                detection_date TEXT,
-                model_version TEXT
-            )
+                CREATE TABLE IF NOT EXISTS procurement_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    notice_id TEXT,
+                    value_eur REAL,
+                    country TEXT,
+                    notice_type TEXT,
+                    is_outlier INTEGER NOT NULL,
+                    anomaly_score REAL,
+                    FOREIGN KEY (run_id) REFERENCES model_runs(run_id)
+                )
             ''')
             
-            # Create index on notice_identifier
-            cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_notice_id 
-            ON procurement_data (notice_identifier)
-            ''')
+            # Create indexes for faster queries
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_run_id ON procurement_results(run_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_outlier ON procurement_results(is_outlier)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_notice_id ON procurement_results(notice_id)')
             
             conn.commit()
-            conn.close()
-            logger.info("Database initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing database: {e}")
-            
-    def _init_metadata(self):
-        """Initialize the metadata file"""
-        metadata = {
-            "last_update": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "total_records": 0,
-            "data_files": [],
-            "models": []
-        }
-        
-        with open(self.metadata_file, 'w') as f:
-            json.dump(metadata, f, indent=4)
-        
-        logger.info("Metadata file initialized")
-        
-    def _update_metadata(self, new_file=None, new_model=None):
-        """Update the metadata file with new information"""
-        try:
-            with open(self.metadata_file, 'r') as f:
-                metadata = json.load(f)
-                
-            # Update timestamp
-            metadata["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Update record count
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM procurement_data")
-            count = cursor.fetchone()[0]
-            conn.close()
-            
-            metadata["total_records"] = count
-            
-            # Add new file if provided
-            if new_file and new_file not in metadata["data_files"]:
-                metadata["data_files"].append(new_file)
-                
-            # Add new model if provided
-            if new_model and new_model not in metadata["models"]:
-                metadata["models"].append(new_model)
-                
-            # Write updated metadata
-            with open(self.metadata_file, 'w') as f:
-                json.dump(metadata, f, indent=4)
-                
-            logger.info("Metadata updated successfully")
-        except Exception as e:
-            logger.error(f"Error updating metadata: {e}")
-            
-    def store_data(self, file_path):
+    
+    def store_results(self, model_type, result_df, parameters=None, notes=None):
         """
-        Store processed data in the persistent storage
+        Store complete model results in one operation
         
         Args:
-            file_path (str): Path to the CSV file to store
+            model_type (str): Type of model ('isolation_forest', 'dbscan', 'kmeans')
+            result_df (pd.DataFrame): DataFrame with outlier detection results
+            parameters (dict): Model parameters
+            notes (str): Additional notes
             
         Returns:
-            bool: True if successful, False otherwise
+            str: Run ID for the stored results
         """
-        try:
-            # Read the CSV file
-            df = pd.read_csv(file_path)
-            logger.info(f"Loaded {len(df)} records from {file_path}")
-            
-            # Make a copy in the data directory
-            filename = os.path.basename(file_path)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            new_filename = f"{os.path.splitext(filename)[0]}_{timestamp}.csv"
-            new_path = os.path.join(self.data_dir, new_filename)
-            
-            shutil.copy2(file_path, new_path)
-            logger.info(f"Copied file to {new_path}")
-            
-            # Extract key data for database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Prepare data for insertion
-            records = []
-            for _, row in df.iterrows():
-                # Extract relevant fields if available
-                notice_id = row.get('notice-identifier', row.get('identifier', 'unknown'))
-                value_eur = row.get('total-value-eur', row.get('value', 0))
-                country = row.get('organisation-country-buyer', row.get('country', 'unknown'))
-                notice_type = row.get('notice-type', 'unknown')
-                bidder_count = row.get('bidder-count', 0)
-                bidder_size = row.get('primary-bidder-size', 'unknown')
-                
-                record = (
-                    notice_id,
-                    value_eur,
-                    country,
-                    notice_type,
-                    row.get('publication-date', datetime.now().strftime("%Y-%m-%d")),
-                    bidder_count,
-                    bidder_size,
-                    new_filename,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                )
-                records.append(record)
-            
-            # Insert records into database
-            cursor.executemany('''
-            INSERT INTO procurement_data 
-            (notice_identifier, value_eur, country, notice_type, created_date, 
-             bidder_count, bidder_size, data_file, import_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', records)
-            
-            conn.commit()
-            conn.close()
-            
-            # Update metadata
-            self._update_metadata(new_file=new_filename)
-            
-            logger.info(f"Successfully stored {len(records)} records in the database")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error storing data: {e}")
-            return False
-            
-    def retrieve_data(self, filters=None, limit=1000):
-        """
-        Retrieve data from storage based on filters
+        run_id = str(uuid.uuid4())
         
-        Args:
-            filters (dict): Optional filters to apply
-            limit (int): Maximum number of records to retrieve
-            
-        Returns:
-            pd.DataFrame: Retrieved data
-        """
         try:
-            conn = sqlite3.connect(self.db_path)
-            
-            # Build query based on filters
-            query = "SELECT * FROM procurement_data"
-            params = []
-            
-            if filters:
-                conditions = []
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
                 
-                if 'country' in filters:
-                    conditions.append("country = ?")
-                    params.append(filters['country'])
+                # Calculate statistics
+                total_records = len(result_df)
+                outlier_count = int(result_df.get('is_outlier', pd.Series([False])).sum())
+                outlier_percentage = (outlier_count / total_records * 100) if total_records > 0 else 0
+                
+                # Store run metadata
+                cursor.execute('''
+                    INSERT INTO model_runs 
+                    (run_id, model_type, parameters, execution_date, record_count, 
+                     outlier_count, outlier_percentage, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    run_id,
+                    model_type,
+                    json.dumps(parameters) if parameters else None,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    total_records,
+                    outlier_count,
+                    outlier_percentage,
+                    notes
+                ))
+                
+                # Prepare procurement results data
+                results_data = []
+                for _, row in result_df.iterrows():
+                    # Extract key fields with fallbacks
+                    notice_id = self._extract_field(row, ['notice-identifier', 'notice_id', 'identifier'])
+                    value_eur = self._extract_numeric_field(row, ['total-value-eur', 'value_eur', 'total-value'])
+                    country = self._extract_field(row, ['organisation-country-buyer', 'country'])
+                    notice_type = self._extract_field(row, ['notice-type', 'notice_type'])
+                    is_outlier = int(row.get('is_outlier', False))
+                    anomaly_score = float(row.get('anomaly_score', 0) or 0)
                     
-                if 'min_value' in filters:
-                    conditions.append("value_eur >= ?")
-                    params.append(filters['min_value'])
-                    
-                if 'max_value' in filters:
-                    conditions.append("value_eur <= ?")
-                    params.append(filters['max_value'])
-                    
-                if 'notice_type' in filters:
-                    conditions.append("notice_type = ?")
-                    params.append(filters['notice_type'])
-                    
-                if 'start_date' in filters:
-                    conditions.append("created_date >= ?")
-                    params.append(filters['start_date'])
-                    
-                if 'end_date' in filters:
-                    conditions.append("created_date <= ?")
-                    params.append(filters['end_date'])
+                    results_data.append((
+                        run_id, notice_id, value_eur, country, notice_type, 
+                        is_outlier, anomaly_score
+                    ))
                 
-                if conditions:
-                    query += " WHERE " + " AND ".join(conditions)
-            
-            # Add limit
-            query += f" LIMIT {limit}"
-            
-            # Execute query
-            df = pd.read_sql_query(query, conn, params=params)
-            conn.close()
-            
-            logger.info(f"Retrieved {len(df)} records from database")
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error retrieving data: {e}")
-            return pd.DataFrame()
-            
-    def store_outliers(self, outliers_df, model_version):
-        """
-        Store detected outliers in the database
-        
-        Args:
-            outliers_df (pd.DataFrame): DataFrame containing outliers
-            model_version (str): Version or identifier of the model used
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        try:
-            # Filter to only outliers
-            if 'is_outlier' in outliers_df.columns:
-                outliers_only = outliers_df[outliers_df['is_outlier'] == True].copy()
-            else:
-                outliers_only = outliers_df.copy()
-                
-            if len(outliers_only) == 0:
-                logger.info("No outliers to store")
-                return True
-                
-            # Connect to database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Prepare records for insertion
-            detection_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            records = []
-            
-            for _, row in outliers_only.iterrows():
-                # Extract relevant fields
-                notice_id = row.get('notice-identifier', row.get('identifier', 'unknown'))
-                value_eur = row.get('total-value-eur', row.get('value', 0))
-                score = row.get('anomaly_score', 0)
-                
-                record = (
-                    notice_id,
-                    value_eur,
-                    score,
-                    detection_date,
-                    model_version
-                )
-                records.append(record)
-                
-            # Insert records
-            cursor.executemany('''
-            INSERT INTO outliers
-            (notice_identifier, value_eur, outlier_score, detection_date, model_version)
-            VALUES (?, ?, ?, ?, ?)
-            ''', records)
-            
-            conn.commit()
-            conn.close()
-            
-            logger.info(f"Stored {len(records)} outliers in the database")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error storing outliers: {e}")
-            return False
-            
-    def cleanup_old_data(self):
-        """
-        Remove data older than max_storage_days
-        
-        Returns:
-            int: Number of records removed
-        """
-        try:
-            # Calculate cutoff date
-            cutoff_date = (datetime.now() - pd.Timedelta(days=self.max_storage_days)).strftime("%Y-%m-%d")
-            
-            # Connect to database
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            # Count records to remove
-            cursor.execute(
-                "SELECT COUNT(*) FROM procurement_data WHERE created_date < ?",
-                (cutoff_date,)
-            )
-            count = cursor.fetchone()[0]
-            
-            if count > 0:
-                # Remove old records
-                cursor.execute(
-                    "DELETE FROM procurement_data WHERE created_date < ?",
-                    (cutoff_date,)
-                )
+                # Store all procurement results
+                cursor.executemany('''
+                    INSERT INTO procurement_results 
+                    (run_id, notice_id, value_eur, country, notice_type, is_outlier, anomaly_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', results_data)
                 
                 conn.commit()
-                logger.info(f"Removed {count} old records from database")
                 
-                # Update metadata
-                self._update_metadata()
-                
-            conn.close()
-            return count
+            logger.info(f"Stored results: {run_id} ({model_type}) - {total_records} records, {outlier_count} outliers ({outlier_percentage:.2f}%)")
+            return run_id
             
         except Exception as e:
-            logger.error(f"Error cleaning up old data: {e}")
-            return 0
+            logger.error(f"Error storing results: {e}")
+            return None
+    
+    def _extract_field(self, row, possible_names, default='unknown'):
+        """Extract field value trying multiple possible column names"""
+        for name in possible_names:
+            if name in row.index and pd.notna(row[name]):
+                return str(row[name])
+        return default
+    
+    def _extract_numeric_field(self, row, possible_names, default=0.0):
+        """Extract numeric field value trying multiple possible column names"""
+        for name in possible_names:
+            if name in row.index and pd.notna(row[name]):
+                try:
+                    return float(row[name])
+                except (ValueError, TypeError):
+                    continue
+        return default
+    
+    def get_run_summary(self, run_id):
+        """Get summary statistics for a specific run"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
             
-    def export_data(self, output_file, filters=None):
-        """
-        Export data from database to CSV file
-        
-        Args:
-            output_file (str): Path to output CSV file
-            filters (dict): Optional filters to apply
+            # Get run metadata
+            cursor.execute('''
+                SELECT * FROM model_runs WHERE run_id = ?
+            ''', (run_id,))
             
-        Returns:
-            bool: True if successful, False otherwise
-        """
+            run_info = cursor.fetchone()
+            if not run_info:
+                return None
+            
+            # Convert to dict and parse parameters
+            result = dict(run_info)
+            if result['parameters']:
+                try:
+                    result['parameters'] = json.loads(result['parameters'])
+                except:
+                    pass
+            
+            # Get outlier details
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_outliers,
+                    AVG(anomaly_score) as avg_score,
+                    MIN(value_eur) as min_value,
+                    MAX(value_eur) as max_value,
+                    AVG(value_eur) as avg_value
+                FROM procurement_results 
+                WHERE run_id = ? AND is_outlier = 1
+            ''', (run_id,))
+            
+            outlier_stats = dict(cursor.fetchone())
+            result['outlier_stats'] = outlier_stats
+            
+            # Get country breakdown
+            cursor.execute('''
+                SELECT 
+                    country,
+                    COUNT(*) as total,
+                    SUM(is_outlier) as outliers,
+                    ROUND(AVG(is_outlier) * 100, 2) as outlier_pct
+                FROM procurement_results 
+                WHERE run_id = ?
+                GROUP BY country
+                ORDER BY total DESC
+                LIMIT 10
+            ''', (run_id,))
+            
+            result['country_breakdown'] = [dict(row) for row in cursor.fetchall()]
+            
+            return result
+    
+    def get_recent_runs(self, limit=10):
+        """Get recent model runs with basic statistics"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT 
+                    run_id,
+                    model_type,
+                    execution_date,
+                    record_count,
+                    outlier_count,
+                    outlier_percentage,
+                    notes
+                FROM model_runs 
+                ORDER BY execution_date DESC 
+                LIMIT ?
+            ''', (limit,))
+            
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_outliers(self, run_id, limit=100):
+        """Get outliers from a specific run"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT *
+                FROM procurement_results 
+                WHERE run_id = ? AND is_outlier = 1
+                ORDER BY anomaly_score DESC
+                LIMIT ?
+            ''', (run_id, limit))
+            
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def get_run_data(self, run_id):
+        """Get all data from a specific run as DataFrame"""
+        with sqlite3.connect(self.db_path) as conn:
+            query = '''
+                SELECT * FROM procurement_results WHERE run_id = ?
+            '''
+            return pd.read_sql_query(query, conn, params=(run_id,))
+    
+    def export_run_csv(self, run_id, output_file):
+        """Export run data to CSV"""
         try:
-            # Retrieve data with filters
-            df = self.retrieve_data(filters=filters, limit=100000)
-            
+            df = self.get_run_data(run_id)
             if df.empty:
-                logger.warning("No data to export")
+                logger.warning(f"No data found for run {run_id}")
                 return False
-                
-            # Save to CSV
+            
             df.to_csv(output_file, index=False)
             logger.info(f"Exported {len(df)} records to {output_file}")
             return True
@@ -407,119 +275,157 @@ class TEDDataStorage:
         except Exception as e:
             logger.error(f"Error exporting data: {e}")
             return False
-            
+    
     def get_statistics(self):
-        """
-        Get statistics about the stored data
-        
-        Returns:
-            dict: Statistics about the data
-        """
-        try:
-            conn = sqlite3.connect(self.db_path)
+        """Get overall database statistics"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
-            # Get total record count
-            cursor.execute("SELECT COUNT(*) FROM procurement_data")
-            total_count = cursor.fetchone()[0]
+            # Basic counts
+            cursor.execute('SELECT COUNT(*) as total_runs FROM model_runs')
+            total_runs = cursor.fetchone()['total_runs']
             
-            # Get outlier count
-            cursor.execute("SELECT COUNT(*) FROM outliers")
-            outlier_count = cursor.fetchone()[0]
+            cursor.execute('SELECT COUNT(*) as total_records FROM procurement_results')
+            total_records = cursor.fetchone()['total_records']
             
-            # Get count by country
-            cursor.execute(
-                "SELECT country, COUNT(*) FROM procurement_data GROUP BY country ORDER BY COUNT(*) DESC LIMIT 10"
-            )
-            countries = {row[0]: row[1] for row in cursor.fetchall()}
+            cursor.execute('SELECT COUNT(*) as total_outliers FROM procurement_results WHERE is_outlier = 1')
+            total_outliers = cursor.fetchone()['total_outliers']
             
-            # Get average value
-            cursor.execute("SELECT AVG(value_eur) FROM procurement_data")
-            avg_value = cursor.fetchone()[0]
+            # Date range
+            cursor.execute('SELECT MIN(execution_date) as first_run, MAX(execution_date) as last_run FROM model_runs')
+            date_range = dict(cursor.fetchone())
             
-            # Get most recent data
-            cursor.execute(
-                "SELECT MAX(import_date) FROM procurement_data"
-            )
-            latest_data = cursor.fetchone()[0]
+            # Model type distribution
+            cursor.execute('''
+                SELECT model_type, COUNT(*) as count 
+                FROM model_runs 
+                GROUP BY model_type 
+                ORDER BY count DESC
+            ''')
+            model_types = {row['model_type']: row['count'] for row in cursor.fetchall()}
             
-            # Get value distribution
-            cursor.execute(
-                """
-                SELECT 
-                    CASE 
-                        WHEN value_eur < 10000 THEN 'Under €10K'
-                        WHEN value_eur < 100000 THEN '€10K-€100K'
-                        WHEN value_eur < 1000000 THEN '€100K-€1M'
-                        WHEN value_eur < 10000000 THEN '€1M-€10M'
-                        ELSE 'Over €10M'
-                    END as value_range,
-                    COUNT(*) as count
-                FROM procurement_data
-                GROUP BY value_range
-                ORDER BY MIN(value_eur)
-                """
-            )
-            value_dist = {row[0]: row[1] for row in cursor.fetchall()}
-            
-            conn.close()
-            
-            # Compile statistics
-            stats = {
-                "total_records": total_count,
-                "total_outliers": outlier_count,
-                "outlier_percentage": round(outlier_count / total_count * 100, 2) if total_count > 0 else 0,
-                "country_distribution": countries,
-                "average_value_eur": round(avg_value, 2) if avg_value else 0,
-                "latest_data_import": latest_data,
-                "value_distribution": value_dist
-            }
-            
-            logger.info("Retrieved database statistics")
-            return stats
-            
-        except Exception as e:
-            logger.error(f"Error retrieving statistics: {e}")
             return {
-                "error": str(e),
-                "total_records": 0,
-                "total_outliers": 0
+                'total_runs': total_runs,
+                'total_records': total_records,
+                'total_outliers': total_outliers,
+                'overall_outlier_percentage': (total_outliers / total_records * 100) if total_records > 0 else 0,
+                'date_range': date_range,
+                'model_types': model_types
             }
+    
+    def cleanup_old_runs(self, days_to_keep=30):
+        """Remove runs older than specified days"""
+        from datetime import datetime, timedelta
+        
+        cutoff_date = (datetime.now() - timedelta(days=days_to_keep)).strftime("%Y-%m-%d")
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
             
-# If run directly, perform a self-test
+            # Get runs to delete
+            cursor.execute('''
+                SELECT run_id FROM model_runs WHERE execution_date < ?
+            ''', (cutoff_date,))
+            
+            old_runs = [row[0] for row in cursor.fetchall()]
+            
+            if old_runs:
+                # Delete procurement results first (foreign key constraint)
+                placeholders = ','.join(['?'] * len(old_runs))
+                cursor.execute(f'''
+                    DELETE FROM procurement_results WHERE run_id IN ({placeholders})
+                ''', old_runs)
+                
+                # Delete model runs
+                cursor.execute(f'''
+                    DELETE FROM model_runs WHERE run_id IN ({placeholders})
+                ''', old_runs)
+                
+                conn.commit()
+                logger.info(f"Cleaned up {len(old_runs)} old runs")
+                
+            return len(old_runs)
+
+
+# Example usage and testing
 if __name__ == "__main__":
     import argparse
     
-    # Parse arguments
     parser = argparse.ArgumentParser(description='TED Data Storage Management')
     parser.add_argument('--stats', action='store_true', help='Show database statistics')
-    parser.add_argument('--cleanup', action='store_true', help='Clean up old data')
-    parser.add_argument('--export', type=str, help='Export data to CSV file')
-    parser.add_argument('--days', type=int, default=365, help='Maximum age of data in days')
+    parser.add_argument('--runs', action='store_true', help='Show recent runs')
+    parser.add_argument('--run-details', type=str, help='Show details for specific run ID')
+    parser.add_argument('--outliers', type=str, help='Show outliers for specific run ID')
+    parser.add_argument('--export', nargs=2, help='Export run data: run_id output_file')
+    parser.add_argument('--cleanup', type=int, help='Clean up runs older than X days')
     
     args = parser.parse_args()
     
-    # Create storage instance
-    storage = TEDDataStorage(max_storage_days=args.days)
+    # Initialize storage
+    storage = TEDDataStorage()
     
     if args.stats:
         stats = storage.get_statistics()
-        print("\nDatabase Statistics:")
-        for key, value in stats.items():
-            if isinstance(value, dict):
-                print(f"\n{key.replace('_', ' ').title()}:")
-                for k, v in value.items():
-                    print(f"  {k}: {v}")
-            else:
-                print(f"{key.replace('_', ' ').title()}: {value}")
-                
-    if args.cleanup:
-        removed = storage.cleanup_old_data()
-        print(f"\nRemoved {removed} records older than {args.days} days")
-        
-    if args.export:
-        success = storage.export_data(args.export)
-        if success:
-            print(f"\nData exported successfully to {args.export}")
+        print("\n=== DATABASE STATISTICS ===")
+        print(f"Total Runs: {stats['total_runs']}")
+        print(f"Total Records: {stats['total_records']:,}")
+        print(f"Total Outliers: {stats['total_outliers']:,} ({stats['overall_outlier_percentage']:.2f}%)")
+        print(f"Date Range: {stats['date_range']['first_run']} to {stats['date_range']['last_run']}")
+        print(f"Model Types: {stats['model_types']}")
+    
+    elif args.runs:
+        runs = storage.get_recent_runs(20)
+        print("\n=== RECENT RUNS ===")
+        for run in runs:
+            print(f"{run['execution_date']} | {run['model_type']} | {run['record_count']:,} records | {run['outlier_count']:,} outliers ({run['outlier_percentage']:.2f}%)")
+            print(f"  Run ID: {run['run_id']}")
+            if run['notes']:
+                print(f"  Notes: {run['notes']}")
+            print()
+    
+    elif args.run_details:
+        details = storage.get_run_summary(args.run_details)
+        if details:
+            print(f"\n=== RUN DETAILS: {args.run_details} ===")
+            print(f"Model Type: {details['model_type']}")
+            print(f"Date: {details['execution_date']}")
+            print(f"Records: {details['record_count']:,}")
+            print(f"Outliers: {details['outlier_count']:,} ({details['outlier_percentage']:.2f}%)")
+            
+            if details['outlier_stats']['total_outliers']:
+                print(f"\nOutlier Statistics:")
+                print(f"  Average Score: {details['outlier_stats']['avg_score']:.4f}")
+                print(f"  Value Range: €{details['outlier_stats']['min_value']:,.2f} - €{details['outlier_stats']['max_value']:,.2f}")
+                print(f"  Average Value: €{details['outlier_stats']['avg_value']:,.2f}")
+            
+            if details['country_breakdown']:
+                print(f"\nTop Countries:")
+                for country in details['country_breakdown'][:5]:
+                    print(f"  {country['country']}: {country['total']:,} records, {country['outliers']} outliers ({country['outlier_pct']}%)")
         else:
-            print("\nFailed to export data")
+            print(f"Run ID not found: {args.run_details}")
+    
+    elif args.outliers:
+        outliers = storage.get_outliers(args.outliers, 20)
+        if outliers:
+            print(f"\n=== OUTLIERS FOR RUN: {args.outliers} ===")
+            for outlier in outliers:
+                print(f"Notice: {outlier['notice_id']} | Value: €{outlier['value_eur']:,.2f} | Score: {outlier['anomaly_score']:.4f} | Country: {outlier['country']}")
+        else:
+            print(f"No outliers found for run: {args.outliers}")
+    
+    elif args.export:
+        run_id, output_file = args.export
+        success = storage.export_run_csv(run_id, output_file)
+        if success:
+            print(f"Data exported to: {output_file}")
+        else:
+            print("Export failed")
+    
+    elif args.cleanup:
+        deleted = storage.cleanup_old_runs(args.cleanup)
+        print(f"Cleaned up {deleted} runs older than {args.cleanup} days")
+    
+    else:
+        parser.print_help()

@@ -369,3 +369,40 @@ if __name__ == "__main__":
     print(f"Normalized data saved to: {result['normalized']}")
     print(f"ML-ready data saved to: {result['ml_dataset']}")
     print(f"ML dataset shape: {result['ml_df'].shape}")
+
+
+
+def create_visualizations(self, df, base_filename="ted_analysis"):
+    if df.empty:
+        logger.warning("Empty dataframe provided, cannot create visualizations")
+        return []
+    
+    saved_files = []
+    try:
+        # 1. Value Distribution
+        value_path = self.plot_value_distribution(df, f"{base_filename}_values.png")
+        if value_path:
+            saved_files.append(value_path)
+        
+        # 2. Outlier Analysis
+        if 'is_outlier' in df.columns:
+            outlier_path = self.plot_outlier_analysis(df, f"{base_filename}_outliers.png")
+            if outlier_path:
+                saved_files.append(outlier_path)
+        
+        # 3. Country Distribution
+        country_field = None
+        for col in ['organisation-country-buyer', 'country']:
+            if col in df.columns:
+                country_field = col
+                break
+        
+        if country_field:
+            country_path = self.plot_country_distribution(df, country_field, f"{base_filename}_countries.png")
+            if country_path:
+                saved_files.append(country_path)
+        
+        return saved_files
+    except Exception as e:
+        logger.error(f"Error creating visualizations: {e}")
+        return saved_files
